@@ -16,6 +16,8 @@
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
 #include "esp_sntp.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include <time.h>
 #include <sys/time.h>
 
@@ -35,6 +37,10 @@
 // Server Configuration (from Kconfig)
 #define SERVER_IP CONFIG_DOOR_SERVER_IP
 #define SERVER_PORT CONFIG_DOOR_SERVER_PORT
+
+// ntfy.sh Configuration (from Kconfig)
+#define NTFY_URL CONFIG_DOOR_NTFY_URL
+#define NTFY_PRIORITY CONFIG_DOOR_NTFY_PRIORITY_VALUE
 
 // WiFi Event Group
 #define WIFI_CONNECTED_BIT BIT0
@@ -98,6 +104,7 @@ void batch_timer_callback(TimerHandle_t xTimer);
 void initialize_sntp(void);
 void wait_for_time_sync(void);
 void sync_time_on_wake(void);
+bool send_ntfy_notification(const char* message);
 
 /**
  * Function to blink the LED a specified number of times
@@ -282,6 +289,86 @@ void sync_time_on_wake(void) {
 }
 
 /**
+ * HTTP event handler for ntfy.sh requests
+ */
+esp_err_t ntfy_http_event_handler(esp_http_client_event_t *evt) {
+    switch(evt->event_id) {
+        case HTTP_EVENT_ERROR:
+            ESP_LOGE(TAG, "HTTP Error");
+            break;
+        case HTTP_EVENT_ON_CONNECTED:
+            ESP_LOGI(TAG, "Connected to ntfy.sh");
+            break;
+        case HTTP_EVENT_HEADER_SENT:
+            ESP_LOGI(TAG, "HTTP headers sent");
+            break;
+        case HTTP_EVENT_ON_FINISH:
+            ESP_LOGI(TAG, "HTTP request finished");
+            break;
+        case HTTP_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "Disconnected from ntfy.sh");
+            break;
+        default:
+            break;
+    }
+    return ESP_OK;
+}
+
+/**
+ * Send notification via ntfy.sh
+ */
+bool send_ntfy_notification(const char* message) {
+    if (!wifi_connected) {
+        ESP_LOGW(TAG, "Cannot send ntfy notification - WiFi not connected");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Sending ntfy notification: %s", message);
+    
+    esp_http_client_config_t config = {
+        .url = NTFY_URL,
+        .event_handler = ntfy_http_event_handler,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 10000,  // 10 second timeout
+        .crt_bundle_attach = esp_crt_bundle_attach,  // Use certificate bundle for HTTPS
+    };
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client");
+        return false;
+    }
+    
+    // Set headers
+    esp_http_client_set_header(client, "Content-Type", "text/plain");
+    esp_http_client_set_header(client, "Priority", NTFY_PRIORITY);
+    esp_http_client_set_header(client, "Title", "Door Monitor");
+    esp_http_client_set_header(client, "Tags", "door,security");
+    
+    // Set the message as POST data
+    esp_http_client_set_post_field(client, message, strlen(message));
+    
+    // Perform the request
+    esp_err_t err = esp_http_client_perform(client);
+    bool success = false;
+    
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        if (status_code == 200) {
+            ESP_LOGI(TAG, "ntfy notification sent successfully");
+            success = true;
+        } else {
+            ESP_LOGW(TAG, "ntfy request failed with status: %d", status_code);
+        }
+    } else {
+        ESP_LOGE(TAG, "ntfy HTTP request failed: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_cleanup(client);
+    return success;
+}
+
+/**
  * Add message to queue
  */
 void queue_message(const char* status) {
@@ -362,27 +449,27 @@ bool send_door_status_with_ack(const char* message) {
 }
 
 /**
- * Process message queue - send all queued messages
+ * Process message queue - send all queued messages via ntfy.sh
  */
 void process_message_queue() {
     if (!wifi_connected || queue_count == 0) {
         return;
     }
     
-    ESP_LOGI(TAG, "Processing %d queued messages", queue_count);
+    ESP_LOGI(TAG, "Processing %d queued messages via ntfy.sh", queue_count);
     
     while (queue_count > 0) {
         char* message = message_queue[queue_head].message;
         
-        if (send_door_status_with_ack(message)) {
-            ESP_LOGI(TAG, "Queued message sent successfully");
+        if (send_ntfy_notification(message)) {
+            ESP_LOGI(TAG, "Queued notification sent successfully via ntfy.sh");
             dequeue_message();
         } else {
-            ESP_LOGW(TAG, "Failed to send queued message, will retry later");
+            ESP_LOGW(TAG, "Failed to send queued notification, will retry later");
             break;  // Stop processing if connection fails
         }
         
-        vTaskDelay(pdMS_TO_TICKS(100));  // Small delay between messages
+        vTaskDelay(pdMS_TO_TICKS(500));  // Small delay between messages to avoid rate limiting
     }
 }
 
@@ -528,9 +615,16 @@ void add_event_to_batch(int door_state, time_t timestamp) {
 }
 
 /**
- * Direct message queuing (for processed events)
+ * Direct message sending (try ntfy immediately, queue if failed)
  */
 void queue_message_direct(const char* message) {
+    // Try to send immediately if WiFi connected
+    if (wifi_connected && send_ntfy_notification(message)) {
+        ESP_LOGI(TAG, "Notification sent immediately via ntfy.sh");
+        return;
+    }
+    
+    // If sending failed or WiFi not connected, queue the message
     if (queue_count >= MAX_QUEUED_MESSAGES) {
         ESP_LOGW(TAG, "Message queue full, dropping oldest message");
         queue_head = (queue_head + 1) % MAX_QUEUED_MESSAGES;
@@ -546,7 +640,7 @@ void queue_message_direct(const char* message) {
     queue_tail = (queue_tail + 1) % MAX_QUEUED_MESSAGES;
     queue_count++;
     
-    ESP_LOGI(TAG, "Queued notification: %s (Queue size: %d)", message, queue_count);
+    ESP_LOGI(TAG, "Queued notification for retry: %s (Queue size: %d)", message, queue_count);
 }
 
 /**

@@ -25,4 +25,38 @@ menu "Door Monitor Configuration"
         help
             TCP port number of the server that will receive door status messages.
 
+    config DOOR_NTFY_URL
+        string "ntfy.sh Topic URL"
+        default "https://ntfy.sh/your_unique_topic_here"
+        help
+            Full URL to your ntfy.sh topic for door notifications.
+            Example: https://ntfy.sh/my_door_sensor_2024
+
+    config DOOR_NTFY_PRIORITY
+        choice DOOR_NTFY_PRIORITY_CHOICE
+            prompt "Notification Priority"
+            default DOOR_NTFY_PRIORITY_DEFAULT
+            help
+                Priority level for ntfy.sh notifications
+        
+            config DOOR_NTFY_PRIORITY_MIN
+                bool "min"
+            config DOOR_NTFY_PRIORITY_LOW
+                bool "low" 
+            config DOOR_NTFY_PRIORITY_DEFAULT
+                bool "default"
+            config DOOR_NTFY_PRIORITY_HIGH
+                bool "high"
+            config DOOR_NTFY_PRIORITY_MAX
+                bool "max"
+        endchoice
+
+    config DOOR_NTFY_PRIORITY_VALUE
+        string
+        default "min" if DOOR_NTFY_PRIORITY_MIN
+        default "low" if DOOR_NTFY_PRIORITY_LOW
+        default "default" if DOOR_NTFY_PRIORITY_DEFAULT
+        default "high" if DOOR_NTFY_PRIORITY_HIGH
+        default "max" if DOOR_NTFY_PRIORITY_MAX
+
 endmenu
