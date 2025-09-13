@@ -105,6 +105,7 @@ void initialize_sntp(void);
 void wait_for_time_sync(void);
 void sync_time_on_wake(void);
 bool send_ntfy_notification(const char* message);
+void format_time_12h(struct tm* timeinfo, char* buffer, size_t size);
 
 /**
  * Function to blink the LED a specified number of times
@@ -474,27 +475,40 @@ void process_message_queue() {
 }
 
 /**
+ * Format time in 12-hour format with AM/PM
+ */
+void format_time_12h(struct tm* timeinfo, char* buffer, size_t size) {
+    int hour = timeinfo->tm_hour;
+    const char* ampm = (hour >= 12) ? "PM" : "AM";
+    
+    if (hour == 0) hour = 12;       // 12 AM
+    else if (hour > 12) hour -= 12; // PM hours
+    
+    snprintf(buffer, size, "%d:%02d %s", hour, timeinfo->tm_min, ampm);
+}
+
+/**
  * Create notification message from event(s)
  */
 void create_notification_message(char* message, size_t max_len, door_event_t* events, int count) {
     if (count == 1) {
-        // Single event
-        const char* status = (events[0].state == DOOR_OPEN) ? "opened" : "closed";
+        // Single event - use exclamation emoji for open doors (security concern)
         struct tm* timeinfo = localtime(&events[0].timestamp);
-        snprintf(message, max_len, 
-                "🚪 Door %s at %02d:%02d", 
-                status, timeinfo->tm_hour, timeinfo->tm_min);
-    } else if (count == 2 && events[0].state == DOOR_OPEN && events[1].state == DOOR_CLOSED) {
-        // Valid pair: OPEN -> CLOSE
-        struct tm* open_time = localtime(&events[0].timestamp);
-        struct tm* close_time = localtime(&events[1].timestamp);
-        int duration_min = (int)((events[1].timestamp - events[0].timestamp) / 60);
+        char time_str[16];
+        format_time_12h(timeinfo, time_str, sizeof(time_str));
         
-        snprintf(message, max_len,
-                "🚪 Door opened & closed (%02d:%02d-%02d:%02d) - %d min duration",
-                open_time->tm_hour, open_time->tm_min,
-                close_time->tm_hour, close_time->tm_min,
-                duration_min);
+        if (events[0].state == DOOR_OPEN) {
+            snprintf(message, max_len, "❗ Door opened at %s", time_str);
+        } else {
+            snprintf(message, max_len, "🚪 Door closed at %s", time_str);
+        }
+    } else if (count == 2 && events[0].state == DOOR_OPEN && events[1].state == DOOR_CLOSED) {
+        // Valid pair: OPEN -> CLOSE - simplified format
+        struct tm* open_time = localtime(&events[0].timestamp);
+        char time_str[16];
+        format_time_12h(open_time, time_str, sizeof(time_str));
+        
+        snprintf(message, max_len, "🚪 Door Open/Close (%s)", time_str);
     } else {
         // Complex pattern - fallback to count
         snprintf(message, max_len, "⚠️ Door activity: %d events detected", count);
