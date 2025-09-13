@@ -33,9 +33,18 @@ def handle_client(conn, addr):
                     # Parse JSON message
                     json_data = json.loads(message)
                     status = json_data.get('STATUS', 'UNKNOWN')
+                    msg_timestamp = json_data.get('TIMESTAMP', 'N/A')
                     
                     # Log the door status
-                    print(f"[{timestamp}] Door Status: {status}")
+                    if msg_timestamp != 'N/A':
+                        msg_time = datetime.datetime.fromtimestamp(int(msg_timestamp)).strftime('%Y-%m-%d %H:%M:%S')
+                        print(f"[{timestamp}] Door Status: {status} (Event time: {msg_time})")
+                    else:
+                        print(f"[{timestamp}] Door Status: {status}")
+                    
+                    # Send acknowledgment back to ESP32
+                    ack_response = "ACK"
+                    conn.send(ack_response.encode('utf-8'))
                     
                     # You can add additional processing here:
                     # - Save to database
@@ -44,6 +53,9 @@ def handle_client(conn, addr):
                     
                 except json.JSONDecodeError:
                     print(f"[{timestamp}] Invalid JSON received: {message}")
+                    # Send NACK for invalid JSON
+                    nack_response = "NACK"
+                    conn.send(nack_response.encode('utf-8'))
                 
     except ConnectionResetError:
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Connection reset by {addr}")
