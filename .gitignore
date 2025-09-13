@@ -1,0 +1,63 @@
+# ESP-IDF Build Artifacts
+build/
+sdkconfig
+sdkconfig.old
+
+# Dependencies
+dependencies.lock
+managed_components/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# ESP-IDF specific
+*.bin
+*.elf
+*.map
+
+# Bootloader
+bootloader/
+
+# Partition table
+partition_table/
+
+# Flash encryption
+flash_encryption_key.bin
+
+# Secure boot
+secure_boot_signing_key.pem
+
+# menuconfig
+sdkconfig.defaults.*
