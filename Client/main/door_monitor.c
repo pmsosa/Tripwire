@@ -4,6 +4,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/timers.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -14,6 +15,9 @@
 #include "lwip/sys.h"
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
+#include "esp_sntp.h"
+#include <time.h>
+#include <sys/time.h>
 
 // Pin definitions
 #define REED_SWITCH_PIN GPIO_NUM_23  // Magnetic reed switch connected to GPIO 23
@@ -40,8 +44,23 @@
 #define MAX_QUEUED_MESSAGES 50
 #define MESSAGE_QUEUE_SIZE 256
 
+// Event Batching Configuration
+#define BATCH_TIMEOUT_MS 60000  // 60 seconds
+#define MAX_EVENT_BUFFER 10
+
+// NTP Configuration
+#define NTP_SERVER "pool.ntp.org"
+#define TIMEZONE "PST8PDT,M3.2.0/2,M11.1.0"  // Pacific Time - change as needed
+
 // Logging tag
 static const char* TAG = "DOOR_SENSOR";
+
+// Door event structure
+typedef struct {
+    int state;          // DOOR_OPEN or DOOR_CLOSED
+    time_t timestamp;
+    bool processed;
+} door_event_t;
 
 // Message queue structure
 typedef struct {
@@ -58,6 +77,27 @@ static door_message_t message_queue[MAX_QUEUED_MESSAGES];
 static int queue_head = 0;
 static int queue_tail = 0;
 static int queue_count = 0;
+
+// Event batching variables
+static door_event_t event_buffer[MAX_EVENT_BUFFER];
+static int event_count = 0;
+static TimerHandle_t batch_timer = NULL;
+static bool batch_timer_active = false;
+
+// NTP variables
+static bool time_synced = false;
+
+// Task notification for batch processing
+static TaskHandle_t main_task_handle = NULL;
+#define BATCH_TIMEOUT_NOTIFICATION (1UL << 0)
+
+// Forward declarations
+void queue_message_direct(const char* message);
+void process_accumulated_events(void);
+void batch_timer_callback(TimerHandle_t xTimer);
+void initialize_sntp(void);
+void wait_for_time_sync(void);
+void sync_time_on_wake(void);
 
 /**
  * Function to blink the LED a specified number of times
@@ -90,6 +130,11 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         s_retry_num = 0;
         wifi_connected = true;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        
+        // Sync time if this is a reconnection (SNTP already initialized)
+        if (esp_sntp_enabled()) {
+            sync_time_on_wake();
+        }
     }
 }
 
@@ -148,6 +193,91 @@ void wifi_init_sta(void) {
         ESP_LOGI(TAG, "Failed to connect to SSID:%s", WIFI_SSID);
     } else {
         ESP_LOGE(TAG, "UNEXPECTED EVENT");
+    }
+}
+
+/**
+ * SNTP sync notification callback
+ */
+void sntp_sync_time_cb(struct timeval *tv) {
+    ESP_LOGI(TAG, "Time synchronized with NTP server");
+    time_synced = true;
+}
+
+/**
+ * Initialize SNTP and sync time
+ */
+void initialize_sntp(void) {
+    ESP_LOGI(TAG, "Initializing SNTP");
+    
+    // Set timezone
+    setenv("TZ", TIMEZONE, 1);
+    tzset();
+    
+    // Initialize SNTP
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, NTP_SERVER);
+    esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+    esp_sntp_set_time_sync_notification_cb(sntp_sync_time_cb);
+    esp_sntp_init();
+    
+    ESP_LOGI(TAG, "SNTP initialized, waiting for time sync...");
+}
+
+/**
+ * Wait for time synchronization with timeout
+ */
+void wait_for_time_sync(void) {
+    int retry = 0;
+    const int retry_count = 30; // 30 seconds timeout
+    
+    while (!time_synced && retry < retry_count) {
+        ESP_LOGI(TAG, "Waiting for time sync... (%d/%d)", retry + 1, retry_count);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        retry++;
+    }
+    
+    if (time_synced) {
+        time_t now;
+        time(&now);
+        struct tm *timeinfo = localtime(&now);
+        char strftime_buf[64];
+        strftime(strftime_buf, sizeof(strftime_buf), "%c", timeinfo);
+        ESP_LOGI(TAG, "Time synced successfully: %s", strftime_buf);
+    } else {
+        ESP_LOGW(TAG, "Time sync timeout - continuing with system time");
+    }
+}
+
+/**
+ * Sync time on demand (for wake from deep sleep)
+ */
+void sync_time_on_wake(void) {
+    if (!wifi_connected) {
+        ESP_LOGW(TAG, "Cannot sync time - WiFi not connected");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Syncing time after wake...");
+    time_synced = false;
+    
+    // Reset SNTP to force immediate sync
+    esp_sntp_stop();
+    esp_sntp_init();
+    
+    // Wait for sync with shorter timeout for battery efficiency
+    int retry = 0;
+    const int retry_count = 10; // 10 seconds timeout
+    
+    while (!time_synced && retry < retry_count) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        retry++;
+    }
+    
+    if (time_synced) {
+        ESP_LOGI(TAG, "Time re-synced successfully");
+    } else {
+        ESP_LOGW(TAG, "Time re-sync timeout - using previous time");
     }
 }
 
@@ -257,6 +387,169 @@ void process_message_queue() {
 }
 
 /**
+ * Create notification message from event(s)
+ */
+void create_notification_message(char* message, size_t max_len, door_event_t* events, int count) {
+    if (count == 1) {
+        // Single event
+        const char* status = (events[0].state == DOOR_OPEN) ? "opened" : "closed";
+        struct tm* timeinfo = localtime(&events[0].timestamp);
+        snprintf(message, max_len, 
+                "🚪 Door %s at %02d:%02d", 
+                status, timeinfo->tm_hour, timeinfo->tm_min);
+    } else if (count == 2 && events[0].state == DOOR_OPEN && events[1].state == DOOR_CLOSED) {
+        // Valid pair: OPEN -> CLOSE
+        struct tm* open_time = localtime(&events[0].timestamp);
+        struct tm* close_time = localtime(&events[1].timestamp);
+        int duration_min = (int)((events[1].timestamp - events[0].timestamp) / 60);
+        
+        snprintf(message, max_len,
+                "🚪 Door opened & closed (%02d:%02d-%02d:%02d) - %d min duration",
+                open_time->tm_hour, open_time->tm_min,
+                close_time->tm_hour, close_time->tm_min,
+                duration_min);
+    } else {
+        // Complex pattern - fallback to count
+        snprintf(message, max_len, "⚠️ Door activity: %d events detected", count);
+    }
+}
+
+/**
+ * Process and send accumulated events
+ */
+void process_accumulated_events() {
+    if (event_count == 0) return;
+    
+    ESP_LOGI(TAG, "Processing %d accumulated events", event_count);
+    
+    int processed = 0;
+    while (processed < event_count) {
+        // Look for OPEN->CLOSE pairs
+        if (processed + 1 < event_count && 
+            event_buffer[processed].state == DOOR_OPEN && 
+            event_buffer[processed + 1].state == DOOR_CLOSED) {
+            
+            // Found a pair
+            char message[256];
+            door_event_t pair[2] = {event_buffer[processed], event_buffer[processed + 1]};
+            create_notification_message(message, sizeof(message), pair, 2);
+            queue_message_direct(message);
+            
+            processed += 2;  // Skip both events in the pair
+        } else {
+            // Single event
+            char message[256];
+            create_notification_message(message, sizeof(message), &event_buffer[processed], 1);
+            queue_message_direct(message);
+            
+            processed += 1;
+        }
+    }
+    
+    // Clear the event buffer
+    event_count = 0;
+    ESP_LOGI(TAG, "Event buffer cleared");
+}
+
+/**
+ * Timer callback for batch timeout - lightweight, just notify main task
+ */
+void batch_timer_callback(TimerHandle_t xTimer) {
+    batch_timer_active = false;
+    // Notify main task to process events (don't do heavy work in timer callback)
+    if (main_task_handle != NULL) {
+        xTaskNotify(main_task_handle, BATCH_TIMEOUT_NOTIFICATION, eSetBits);
+    }
+}
+
+/**
+ * Add event to batch buffer
+ */
+void add_event_to_batch(int door_state, time_t timestamp) {
+    if (event_count >= MAX_EVENT_BUFFER) {
+        ESP_LOGW(TAG, "Event buffer full, processing immediately");
+        process_accumulated_events();
+    }
+    
+    // Add new event
+    event_buffer[event_count].state = door_state;
+    event_buffer[event_count].timestamp = timestamp;
+    event_buffer[event_count].processed = false;
+    event_count++;
+    
+    ESP_LOGI(TAG, "Added event to batch: %s (buffer size: %d)", 
+             (door_state == DOOR_OPEN) ? "OPEN" : "CLOSE", event_count);
+    
+    // Check for immediate pair completion
+    if (event_count >= 2) {
+        int last = event_count - 1;
+        int prev = event_count - 2;
+        
+        // If we have OPEN->CLOSE pair, process it immediately
+        if (event_buffer[prev].state == DOOR_OPEN && 
+            event_buffer[last].state == DOOR_CLOSED) {
+            
+            ESP_LOGI(TAG, "Complete pair detected, processing immediately");
+            
+            // Create pair message
+            char message[256];
+            door_event_t pair[2] = {event_buffer[prev], event_buffer[last]};
+            create_notification_message(message, sizeof(message), pair, 2);
+            queue_message_direct(message);
+            
+            // Remove the pair from buffer
+            event_count -= 2;
+            
+            // Shift remaining events (if any)
+            for (int i = 0; i < event_count; i++) {
+                event_buffer[i] = event_buffer[i + 2];
+            }
+            
+            // If buffer is empty, stop timer
+            if (event_count == 0 && batch_timer_active) {
+                xTimerStop(batch_timer, 0);
+                batch_timer_active = false;
+                ESP_LOGI(TAG, "Buffer empty, stopping batch timer");
+            }
+            
+            return;  // Don't start/restart timer
+        }
+    }
+    
+    // Start or restart timer for remaining events
+    if (batch_timer_active) {
+        xTimerReset(batch_timer, 0);
+        ESP_LOGI(TAG, "Batch timer reset");
+    } else {
+        xTimerStart(batch_timer, 0);
+        batch_timer_active = true;
+        ESP_LOGI(TAG, "Batch timer started");
+    }
+}
+
+/**
+ * Direct message queuing (for processed events)
+ */
+void queue_message_direct(const char* message) {
+    if (queue_count >= MAX_QUEUED_MESSAGES) {
+        ESP_LOGW(TAG, "Message queue full, dropping oldest message");
+        queue_head = (queue_head + 1) % MAX_QUEUED_MESSAGES;
+        queue_count--;
+    }
+    
+    time_t now;
+    time(&now);
+    strncpy(message_queue[queue_tail].message, message, MESSAGE_QUEUE_SIZE - 1);
+    message_queue[queue_tail].message[MESSAGE_QUEUE_SIZE - 1] = '\0';
+    message_queue[queue_tail].timestamp = now;
+    
+    queue_tail = (queue_tail + 1) % MAX_QUEUED_MESSAGES;
+    queue_count++;
+    
+    ESP_LOGI(TAG, "Queued notification: %s (Queue size: %d)", message, queue_count);
+}
+
+/**
  * Send door status to server via TCP (legacy function for immediate send)
  */
 void send_door_status(const char* status) {
@@ -324,6 +617,9 @@ void configure_gpio(void) {
  * Main application entry point
  */
 void app_main(void) {
+    // Store main task handle for notifications
+    main_task_handle = xTaskGetCurrentTaskHandle();
+    
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -335,15 +631,44 @@ void app_main(void) {
     // Initialize GPIO pins
     configure_gpio();
     
+    // Create batch timer (but don't start it yet)
+    batch_timer = xTimerCreate("BatchTimer", 
+                              pdMS_TO_TICKS(BATCH_TIMEOUT_MS),
+                              pdFALSE,  // One-shot timer
+                              (void*)0,
+                              batch_timer_callback);
+    
+    if (batch_timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create batch timer");
+        return;
+    }
+    
     // Initialize WiFi
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
     
+    // Initialize and sync time via NTP
+    if (wifi_connected) {
+        initialize_sntp();
+        wait_for_time_sync();
+    } else {
+        ESP_LOGW(TAG, "WiFi not connected - time sync skipped");
+    }
+    
     // Print startup message
-    ESP_LOGI(TAG, "Door monitoring system started. Monitoring GPIO %d for door state changes.", REED_SWITCH_PIN);
+    ESP_LOGI(TAG, "Door monitoring system with NTP sync and event batching started. Monitoring GPIO %d.", REED_SWITCH_PIN);
     
     // Main monitoring loop
     while (1) {
+        // Check for batch timer notification (non-blocking)
+        uint32_t notification_value;
+        if (xTaskNotifyWait(0, ULONG_MAX, &notification_value, 0) == pdTRUE) {
+            if (notification_value & BATCH_TIMEOUT_NOTIFICATION) {
+                ESP_LOGI(TAG, "Batch timer expired, processing events");
+                process_accumulated_events();
+            }
+        }
+        
         // Process any queued messages if WiFi is connected
         process_message_queue();
         
@@ -355,43 +680,26 @@ void app_main(void) {
             // Update the current state
             current_door_state = door_state;
             
+            // Get current time for event
+            time_t now;
+            time(&now);
+            
             // Perform actions based on door state
             if (door_state == DOOR_OPEN) {
                 // Door opened
                 ESP_LOGI(TAG, "Door Opened!");
                 blink_led(1);  // Blink LED once
                 
-                // Try to send immediately if connected, otherwise queue
-                if (wifi_connected) {
-                    char message[100];
-                    time_t now;
-                    time(&now);
-                    snprintf(message, sizeof(message), "{\"STATUS\":\"OPENED\",\"TIMESTAMP\":%lld}", (long long)now);
-                    
-                    if (!send_door_status_with_ack(message)) {
-                        queue_message("OPENED");
-                    }
-                } else {
-                    queue_message("OPENED");
-                }
+                // Add to batch processing
+                add_event_to_batch(DOOR_OPEN, now);
+                
             } else {
                 // Door closed
                 ESP_LOGI(TAG, "Door Closed!");
                 blink_led(2);  // Blink LED twice
                 
-                // Try to send immediately if connected, otherwise queue
-                if (wifi_connected) {
-                    char message[100];
-                    time_t now;
-                    time(&now);
-                    snprintf(message, sizeof(message), "{\"STATUS\":\"CLOSED\",\"TIMESTAMP\":%lld}", (long long)now);
-                    
-                    if (!send_door_status_with_ack(message)) {
-                        queue_message("CLOSED");
-                    }
-                } else {
-                    queue_message("CLOSED");
-                }
+                // Add to batch processing
+                add_event_to_batch(DOOR_CLOSED, now);
             }
         }
         
