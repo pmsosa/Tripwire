@@ -1,0 +1,28 @@
+menu "Door Monitor Configuration"
+
+    config DOOR_WIFI_SSID
+        string "WiFi SSID"
+        default "MyWiFiNetwork"
+        help
+            SSID (network name) for the door monitor to connect to.
+
+    config DOOR_WIFI_PASSWORD
+        string "WiFi Password"
+        default "password123"
+        help
+            WiFi password (WPA or WPA2) for the door monitor to connect to.
+
+    config DOOR_SERVER_IP
+        string "Server IP Address"
+        default "192.168.1.100"
+        help
+            IP address of the TCP server that will receive door status messages.
+
+    config DOOR_SERVER_PORT
+        int "Server Port"
+        range 1024 65535
+        default 8080
+        help
+            TCP port number of the server that will receive door status messages.
+
+endmenu
