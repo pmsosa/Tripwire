@@ -5,6 +5,7 @@ sdkconfig.old
 
 # Local configuration (contains WiFi credentials)
 sdkconfig.local
+.env
 
 # Dependencies
 dependencies.lock

@@ -1,15 +1,15 @@
 # Default configuration for Door Monitor
 # These values will be used if not configured via menuconfig
 
-# WiFi Configuration (CHANGE THESE BEFORE BUILDING!)
-CONFIG_DOOR_WIFI_SSID="CHANGE_ME"
-CONFIG_DOOR_WIFI_PASSWORD="CHANGE_ME"
+# WiFi Configuration (populated from environment variables)
+CONFIG_DOOR_WIFI_SSID="[REDACTED]"
+CONFIG_DOOR_WIFI_PASSWORD="[REDACTED]"
 
-# Bluetooth Configuration
-CONFIG_DOOR_PHONE_BT_MAC="AA:BB:CC:DD:EE:FF"
+# Bluetooth Configuration (populated from environment variables)
+CONFIG_DOOR_PHONE_BT_MAC="[REDACTED]"
 
-# ntfy.sh Configuration
-CONFIG_DOOR_NTFY_URL="https://ntfy.sh/your_unique_topic_here"
+# ntfy.sh Configuration (populated from environment variables)
+CONFIG_DOOR_NTFY_URL="https://ntfy.sh/[REDACTED]"
 CONFIG_DOOR_NTFY_PRIORITY_DEFAULT=y
 
 # Enable WiFi and HTTP Client
@@ -25,6 +25,11 @@ CONFIG_BT_CTRL_BLE_MAX_CONN=0
 CONFIG_BT_CTRL_BR_EDR_MAX_ACL_CONN=1
 CONFIG_BT_CTRL_BR_EDR_MAX_SYNC_CONN=0
 
+# Fix controller mode - enable Classic BT support
+CONFIG_BTDM_CONTROLLER_MODE_BR_EDR_ONLY=y
+# CONFIG_BTDM_CONTROLLER_MODE_BLE_ONLY is not set
+# CONFIG_BTDM_CONTROLLER_MODE_BTDM is not set
+
 # Enable HTTPS/TLS support
 CONFIG_ESP_TLS_USING_MBEDTLS=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
@@ -32,6 +37,11 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 
 # Memory optimizations to reduce IRAM usage
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Enable debug logging for Bluetooth components
+CONFIG_LOG_MAXIMUM_LEVEL=4
+CONFIG_BT_LOG_LEVEL_DEBUG=y
+CONFIG_BTDM_LOG_LEVEL_DEBUG=y
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
 CONFIG_SPI_FLASH_DANGEROUS_WRITE_ABORTS=n

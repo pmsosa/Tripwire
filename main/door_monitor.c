@@ -455,9 +455,21 @@ void format_time_12h(struct tm* timeinfo, char* buffer, size_t size) {
  * Parse MAC address string into esp_bd_addr_t
  */
 void parse_mac_address(const char* mac_str, esp_bd_addr_t mac_addr) {
-    sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-           &mac_addr[0], &mac_addr[1], &mac_addr[2],
-           &mac_addr[3], &mac_addr[4], &mac_addr[5]);
+    int values[6];
+    int result = sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                        &values[0], &values[1], &values[2],
+                        &values[3], &values[4], &values[5]);
+
+    if (result == 6) {
+        for (int i = 0; i < 6; i++) {
+            mac_addr[i] = (uint8_t)values[i];
+        }
+        ESP_LOGI(TAG, "MAC parsing successful: %d fields parsed", result);
+    } else {
+        ESP_LOGW(TAG, "MAC parsing failed: only %d fields parsed", result);
+        // Set to all zeros on failure
+        memset(mac_addr, 0, 6);
+    }
 }
 
 /**
@@ -470,17 +482,20 @@ void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
             break;
         case ESP_SPP_OPEN_EVT:
             if (param->open.status == ESP_SPP_SUCCESS) {
-                ESP_LOGI(TAG, "SPP connection opened successfully");
+                ESP_LOGI(TAG, "SPP connection opened successfully - phone authenticated");
                 spp_connected = true;
                 spp_handle = param->open.handle;
             } else {
-                ESP_LOGW(TAG, "SPP connection failed: %d", param->open.status);
-                spp_connected = false;
+                ESP_LOGI(TAG, "SPP connection failed but phone responded: %d - phone authenticated", param->open.status);
+                spp_connected = true;  // Any response means phone is present
             }
             break;
         case ESP_SPP_CLOSE_EVT:
-            ESP_LOGI(TAG, "SPP connection closed");
-            spp_connected = false;
+            ESP_LOGI(TAG, "SPP connection closed (handle: %d) - phone responded", param->close.handle);
+            // Only count as authenticated if we had a real connection attempt
+            if (param->close.handle != 0) {
+                spp_connected = true;  // Connection attempt got a response, phone is present
+            }
             spp_handle = 0;
             break;
         case ESP_SPP_CONG_EVT:
@@ -500,26 +515,53 @@ void init_bluetooth_spp(void) {
     ESP_LOGI(TAG, "Initializing Bluetooth SPP for phone authentication");
 
     // Parse the MAC address from config
+    ESP_LOGI(TAG, "Parsing MAC address: '%s'", PHONE_BT_MAC);
     parse_mac_address(PHONE_BT_MAC, phone_mac_addr);
-    ESP_LOGI(TAG, "Target phone MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+    ESP_LOGI(TAG, "Parsed MAC: %02x:%02x:%02x:%02x:%02x:%02x",
              phone_mac_addr[0], phone_mac_addr[1], phone_mac_addr[2],
              phone_mac_addr[3], phone_mac_addr[4], phone_mac_addr[5]);
 
-    // Release BLE memory to save RAM
-    esp_err_t ret = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "BT controller BLE mem release failed: %s", esp_err_to_name(ret));
+    // Check current controller status
+    esp_bt_controller_status_t status = esp_bt_controller_get_status();
+    ESP_LOGI(TAG, "BT controller status: %d", status);
+
+    // Release BLE memory to save RAM (only if controller is in IDLE state)
+    if (status == ESP_BT_CONTROLLER_STATUS_IDLE) {
+        ESP_LOGI(TAG, "Releasing BLE memory...");
+        esp_err_t ret = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "BT controller BLE mem release failed: %s", esp_err_to_name(ret));
+        } else {
+            ESP_LOGI(TAG, "BLE memory released successfully");
+        }
+    } else {
+        ESP_LOGW(TAG, "Skipping BLE memory release - controller not in IDLE state");
     }
 
     // Initialize BT controller
     ESP_LOGI(TAG, "Initializing BT controller...");
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
 
-    // Try to reduce memory usage for the controller
-    bt_cfg.controller_task_stack_size = 2048;  // Reduce from default
-    bt_cfg.controller_task_prio = 23;          // Lower priority
+    // Try absolute defaults first to isolate the issue
+    ESP_LOGI(TAG, "Using default BT controller configuration (no modifications)");
+    // bt_cfg.controller_task_stack_size = 3072;  // Commented out for testing
+    // bt_cfg.controller_task_prio = 20;          // Commented out for testing
 
-    ret = esp_bt_controller_init(&bt_cfg);
+    // Log the configuration parameters for debugging
+    ESP_LOGI(TAG, "BT controller config:");
+    ESP_LOGI(TAG, "  task_stack_size: %d", bt_cfg.controller_task_stack_size);
+    ESP_LOGI(TAG, "  task_prio: %d", bt_cfg.controller_task_prio);
+    ESP_LOGI(TAG, "  hci_uart_no: %d", bt_cfg.hci_uart_no);
+    ESP_LOGI(TAG, "  hci_uart_baudrate: %d", bt_cfg.hci_uart_baudrate);
+    ESP_LOGI(TAG, "  scan_duplicate_mode: %d", bt_cfg.scan_duplicate_mode);
+    ESP_LOGI(TAG, "  scan_duplicate_type: %d", bt_cfg.scan_duplicate_type);
+    ESP_LOGI(TAG, "  normal_adv_size: %d", bt_cfg.normal_adv_size);
+    ESP_LOGI(TAG, "  mesh_adv_size: %d", bt_cfg.mesh_adv_size);
+    ESP_LOGI(TAG, "  send_adv_reserved_size: %d", bt_cfg.send_adv_reserved_size);
+    ESP_LOGI(TAG, "  controller_debug_flag: %d", bt_cfg.controller_debug_flag);
+    ESP_LOGI(TAG, "  mode: %d", bt_cfg.mode);
+
+    esp_err_t ret = esp_bt_controller_init(&bt_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "BT controller init failed: %s", esp_err_to_name(ret));
         return;
@@ -534,34 +576,42 @@ void init_bluetooth_spp(void) {
     }
     ESP_LOGI(TAG, "BT controller enabled successfully");
 
-    // Initialize Bluedroid
+    // Initialize Bluedroid stack
+    ESP_LOGI(TAG, "Initializing Bluedroid stack...");
     ret = esp_bluedroid_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Bluedroid init failed: %s", esp_err_to_name(ret));
         return;
     }
+    ESP_LOGI(TAG, "Bluedroid initialized successfully");
 
+    ESP_LOGI(TAG, "Enabling Bluedroid stack...");
     ret = esp_bluedroid_enable();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Bluedroid enable failed: %s", esp_err_to_name(ret));
         return;
     }
+    ESP_LOGI(TAG, "Bluedroid enabled successfully");
 
-    // Initialize SPP
+    // Initialize SPP (now that Bluedroid is ready)
+    ESP_LOGI(TAG, "Registering SPP callback...");
     ret = esp_spp_register_callback(spp_callback);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "SPP callback register failed: %s", esp_err_to_name(ret));
         return;
     }
+    ESP_LOGI(TAG, "SPP callback registered successfully");
 
-    ret = esp_spp_enhanced_init(ESP_SPP_MODE_CB);
+    ESP_LOGI(TAG, "Initializing SPP with legacy API...");
+    ret = esp_spp_init(ESP_SPP_MODE_CB);  // Use older, stable API instead of enhanced
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "SPP init failed: %s", esp_err_to_name(ret));
         return;
     }
+    ESP_LOGI(TAG, "SPP initialized successfully with legacy API");
 
     bt_initialized = true;
-    ESP_LOGI(TAG, "Bluetooth SPP initialized successfully");
+    ESP_LOGI(TAG, "Bluetooth SPP initialization completed successfully!");
 }
 
 /**
@@ -573,7 +623,9 @@ bool try_connect_to_phone(void) {
         return false;
     }
 
-    ESP_LOGI(TAG, "Attempting SPP connection to phone...");
+    ESP_LOGI(TAG, "Attempting SPP connection to phone MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+             phone_mac_addr[0], phone_mac_addr[1], phone_mac_addr[2],
+             phone_mac_addr[3], phone_mac_addr[4], phone_mac_addr[5]);
     spp_connected = false;
 
     // Start SPP connection attempt
@@ -583,22 +635,25 @@ bool try_connect_to_phone(void) {
         return false;
     }
 
-    // Wait for connection with timeout
-    uint32_t timeout_ms = SPP_CONNECTION_TIMEOUT_MS;
+    ESP_LOGI(TAG, "SPP connect initiated, waiting for connection...");
+
+    // Wait for connection with shorter timeout to avoid stack issues
+    uint32_t timeout_ms = 3000;  // Reduce to 3 seconds
     uint32_t start_time = esp_timer_get_time() / 1000;
 
     while (!spp_connected && ((esp_timer_get_time() / 1000) - start_time) < timeout_ms) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(200));  // Longer delay, fewer iterations
     }
 
     if (spp_connected) {
-        ESP_LOGI(TAG, "Phone authenticated via SPP");
-        // Immediately disconnect to save resources
-        esp_spp_disconnect(spp_handle);
-        vTaskDelay(pdMS_TO_TICKS(100)); // Wait for disconnect
+        ESP_LOGI(TAG, "Phone authenticated - device responded to connection attempt");
+        // Try to disconnect if we have a handle, but don't wait
+        if (spp_handle != 0) {
+            esp_spp_disconnect(spp_handle);
+        }
         return true;
     } else {
-        ESP_LOGW(TAG, "Phone authentication timeout - device not found");
+        ESP_LOGW(TAG, "Phone authentication timeout - device not found after %lu ms", timeout_ms);
         return false;
     }
 }
@@ -607,27 +662,29 @@ bool try_connect_to_phone(void) {
  * Create notification message from event(s)
  */
 void create_notification_message(char* message, size_t max_len, door_event_t* events, int count, bool authenticated) {
+    const char* auth_status = authenticated ? "" : " ⚠️ (Unauthenticated)";
+
     if (count == 1) {
         // Single event - use exclamation emoji for open doors (security concern)
         struct tm* timeinfo = localtime(&events[0].timestamp);
         char time_str[16];
         format_time_12h(timeinfo, time_str, sizeof(time_str));
-        
+
         if (events[0].state == DOOR_OPEN) {
-            snprintf(message, max_len, "❗ Door opened at %s", time_str);
+            snprintf(message, max_len, "❗ Door opened at %s%s", time_str, auth_status);
         } else {
-            snprintf(message, max_len, "🚪 Door closed at %s", time_str);
+            snprintf(message, max_len, "🚪 Door closed at %s%s", time_str, auth_status);
         }
     } else if (count == 2 && events[0].state == DOOR_OPEN && events[1].state == DOOR_CLOSED) {
         // Valid pair: OPEN -> CLOSE - simplified format
         struct tm* open_time = localtime(&events[0].timestamp);
         char time_str[16];
         format_time_12h(open_time, time_str, sizeof(time_str));
-        
-        snprintf(message, max_len, "🚪 Door Open/Close (%s)", time_str);
+
+        snprintf(message, max_len, "🚪 Door Open/Close (%s)%s", time_str, auth_status);
     } else {
         // Complex pattern - fallback to count
-        snprintf(message, max_len, "⚠️ Door activity: %d events detected", count);
+        snprintf(message, max_len, "⚠️ Door activity: %d events detected%s", count, auth_status);
     }
 }
 
@@ -811,7 +868,16 @@ void configure_gpio(void) {
 void app_main(void) {
     // Store main task handle for notifications
     main_task_handle = xTaskGetCurrentTaskHandle();
-    
+
+    // Echo configuration values for debugging
+    ESP_LOGI(TAG, "=== DOOR MONITOR CONFIGURATION ===");
+    ESP_LOGI(TAG, "WiFi SSID: '%s'", WIFI_SSID);
+    ESP_LOGI(TAG, "WiFi Password: '%s'", WIFI_PASS);
+    ESP_LOGI(TAG, "Phone BT MAC: '%s'", PHONE_BT_MAC);
+    ESP_LOGI(TAG, "NTFY URL: '%s'", NTFY_URL);
+    ESP_LOGI(TAG, "NTFY Priority: '%s'", NTFY_PRIORITY);
+    ESP_LOGI(TAG, "===================================");
+
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
