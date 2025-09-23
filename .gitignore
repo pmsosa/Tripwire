@@ -1,13 +1,10 @@
 # ESP-IDF Build Artifacts
 build/
-Client/build/
 sdkconfig
 sdkconfig.old
-Client/sdkconfig
-Client/sdkconfig.old
 
 # Local configuration (contains WiFi credentials)
-Client/sdkconfig.local
+sdkconfig.local
 
 # Dependencies
 dependencies.lock

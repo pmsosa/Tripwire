@@ -10,14 +10,15 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
-#include "lwip/err.h"
-#include "lwip/sockets.h"
-#include "lwip/sys.h"
-#include "lwip/netdb.h"
-#include "lwip/dns.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "esp_gap_bt_api.h"
+#include "esp_spp_api.h"
 #include "esp_sntp.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_timer.h"
 #include <time.h>
 #include <sys/time.h>
 
@@ -34,9 +35,8 @@
 #define WIFI_PASS CONFIG_DOOR_WIFI_PASSWORD
 #define WIFI_MAXIMUM_RETRY 5
 
-// Server Configuration (from Kconfig)
-#define SERVER_IP CONFIG_DOOR_SERVER_IP
-#define SERVER_PORT CONFIG_DOOR_SERVER_PORT
+// Bluetooth Configuration (from Kconfig)
+#define PHONE_BT_MAC CONFIG_DOOR_PHONE_BT_MAC
 
 // ntfy.sh Configuration (from Kconfig)
 #define NTFY_URL CONFIG_DOOR_NTFY_URL
@@ -47,12 +47,12 @@
 #define WIFI_FAIL_BIT      BIT1
 
 // Message Queue Configuration
-#define MAX_QUEUED_MESSAGES 50
-#define MESSAGE_QUEUE_SIZE 256
+#define MAX_QUEUED_MESSAGES 20
+#define MESSAGE_QUEUE_SIZE 128
 
 // Event Batching Configuration
 #define BATCH_TIMEOUT_MS 60000  // 60 seconds
-#define MAX_EVENT_BUFFER 10
+#define MAX_EVENT_BUFFER 5
 
 // NTP Configuration
 #define NTP_SERVER "pool.ntp.org"
@@ -93,6 +93,13 @@ static bool batch_timer_active = false;
 // NTP variables
 static bool time_synced = false;
 
+// Bluetooth SPP variables
+static bool bt_initialized = false;
+static bool spp_connected = false;
+static esp_bd_addr_t phone_mac_addr;
+static uint32_t spp_handle = 0;
+#define SPP_CONNECTION_TIMEOUT_MS 10000  // 10 seconds as requested
+
 // Task notification for batch processing
 static TaskHandle_t main_task_handle = NULL;
 #define BATCH_TIMEOUT_NOTIFICATION (1UL << 0)
@@ -106,12 +113,16 @@ void wait_for_time_sync(void);
 void sync_time_on_wake(void);
 bool send_ntfy_notification(const char* message);
 void format_time_12h(struct tm* timeinfo, char* buffer, size_t size);
+void init_bluetooth_spp(void);
+bool try_connect_to_phone(void);
+void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param);
+void parse_mac_address(const char* mac_str, esp_bd_addr_t mac_addr);
 
 /**
  * Function to blink the LED a specified number of times
  * @param blink_count Number of times to blink the LED
  */
-void blink_led(int blink_count) {
+static void blink_led(int blink_count) {
     for (int i = 0; i < blink_count; i++) {
         gpio_set_level(LED_PIN, 1);  // Turn LED on
         vTaskDelay(pdMS_TO_TICKS(200));  // Wait 200ms
@@ -401,53 +412,6 @@ void dequeue_message() {
     }
 }
 
-/**
- * Send door status to server via TCP with acknowledgment
- */
-bool send_door_status_with_ack(const char* message) {
-    int sock = 0;
-    struct sockaddr_in serv_addr;
-    char response[64] = {0};
-
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        ESP_LOGE(TAG, "Socket creation error");
-        return false;
-    }
-
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(SERVER_PORT);
-
-    if (inet_pton(AF_INET, SERVER_IP, &serv_addr.sin_addr) <= 0) {
-        ESP_LOGE(TAG, "Invalid address/ Address not supported");
-        close(sock);
-        return false;
-    }
-
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        ESP_LOGE(TAG, "Connection Failed");
-        close(sock);
-        return false;
-    }
-
-    // Send message
-    send(sock, message, strlen(message), 0);
-    ESP_LOGI(TAG, "Message sent: %s", message);
-
-    // Wait for acknowledgment
-    int bytes_received = recv(sock, response, sizeof(response) - 1, 0);
-    close(sock);
-
-    if (bytes_received > 0) {
-        response[bytes_received] = '\0';
-        if (strstr(response, "ACK") != NULL) {
-            ESP_LOGI(TAG, "Server acknowledged message");
-            return true;
-        }
-    }
-    
-    ESP_LOGW(TAG, "No acknowledgment received from server");
-    return false;
-}
 
 /**
  * Process message queue - send all queued messages via ntfy.sh
@@ -488,9 +452,161 @@ void format_time_12h(struct tm* timeinfo, char* buffer, size_t size) {
 }
 
 /**
+ * Parse MAC address string into esp_bd_addr_t
+ */
+void parse_mac_address(const char* mac_str, esp_bd_addr_t mac_addr) {
+    sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+           &mac_addr[0], &mac_addr[1], &mac_addr[2],
+           &mac_addr[3], &mac_addr[4], &mac_addr[5]);
+}
+
+/**
+ * SPP callback function
+ */
+void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
+    switch (event) {
+        case ESP_SPP_INIT_EVT:
+            ESP_LOGI(TAG, "SPP initialized");
+            break;
+        case ESP_SPP_OPEN_EVT:
+            if (param->open.status == ESP_SPP_SUCCESS) {
+                ESP_LOGI(TAG, "SPP connection opened successfully");
+                spp_connected = true;
+                spp_handle = param->open.handle;
+            } else {
+                ESP_LOGW(TAG, "SPP connection failed: %d", param->open.status);
+                spp_connected = false;
+            }
+            break;
+        case ESP_SPP_CLOSE_EVT:
+            ESP_LOGI(TAG, "SPP connection closed");
+            spp_connected = false;
+            spp_handle = 0;
+            break;
+        case ESP_SPP_CONG_EVT:
+            ESP_LOGD(TAG, "SPP congestion status: %d", param->cong.cong);
+            break;
+        default:
+            break;
+    }
+}
+
+/**
+ * Initialize Bluetooth SPP
+ */
+void init_bluetooth_spp(void) {
+    if (bt_initialized) return;
+
+    ESP_LOGI(TAG, "Initializing Bluetooth SPP for phone authentication");
+
+    // Parse the MAC address from config
+    parse_mac_address(PHONE_BT_MAC, phone_mac_addr);
+    ESP_LOGI(TAG, "Target phone MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+             phone_mac_addr[0], phone_mac_addr[1], phone_mac_addr[2],
+             phone_mac_addr[3], phone_mac_addr[4], phone_mac_addr[5]);
+
+    // Release BLE memory to save RAM
+    esp_err_t ret = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "BT controller BLE mem release failed: %s", esp_err_to_name(ret));
+    }
+
+    // Initialize BT controller
+    ESP_LOGI(TAG, "Initializing BT controller...");
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+
+    // Try to reduce memory usage for the controller
+    bt_cfg.controller_task_stack_size = 2048;  // Reduce from default
+    bt_cfg.controller_task_prio = 23;          // Lower priority
+
+    ret = esp_bt_controller_init(&bt_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BT controller init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "BT controller initialized successfully");
+
+    ESP_LOGI(TAG, "Enabling BT controller for Classic BT...");
+    ret = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BT controller enable failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "BT controller enabled successfully");
+
+    // Initialize Bluedroid
+    ret = esp_bluedroid_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluedroid init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_bluedroid_enable();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluedroid enable failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    // Initialize SPP
+    ret = esp_spp_register_callback(spp_callback);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPP callback register failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_spp_enhanced_init(ESP_SPP_MODE_CB);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPP init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    bt_initialized = true;
+    ESP_LOGI(TAG, "Bluetooth SPP initialized successfully");
+}
+
+/**
+ * Try to connect to phone via SPP with 10-second timeout
+ */
+bool try_connect_to_phone(void) {
+    if (!bt_initialized) {
+        ESP_LOGW(TAG, "Bluetooth not initialized");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Attempting SPP connection to phone...");
+    spp_connected = false;
+
+    // Start SPP connection attempt
+    esp_err_t ret = esp_spp_connect(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_MASTER, 1, phone_mac_addr);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "SPP connect failed: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    // Wait for connection with timeout
+    uint32_t timeout_ms = SPP_CONNECTION_TIMEOUT_MS;
+    uint32_t start_time = esp_timer_get_time() / 1000;
+
+    while (!spp_connected && ((esp_timer_get_time() / 1000) - start_time) < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (spp_connected) {
+        ESP_LOGI(TAG, "Phone authenticated via SPP");
+        // Immediately disconnect to save resources
+        esp_spp_disconnect(spp_handle);
+        vTaskDelay(pdMS_TO_TICKS(100)); // Wait for disconnect
+        return true;
+    } else {
+        ESP_LOGW(TAG, "Phone authentication timeout - device not found");
+        return false;
+    }
+}
+
+/**
  * Create notification message from event(s)
  */
-void create_notification_message(char* message, size_t max_len, door_event_t* events, int count) {
+void create_notification_message(char* message, size_t max_len, door_event_t* events, int count, bool authenticated) {
     if (count == 1) {
         // Single event - use exclamation emoji for open doors (security concern)
         struct tm* timeinfo = localtime(&events[0].timestamp);
@@ -533,14 +649,16 @@ void process_accumulated_events() {
             // Found a pair
             char message[256];
             door_event_t pair[2] = {event_buffer[processed], event_buffer[processed + 1]};
-            create_notification_message(message, sizeof(message), pair, 2);
+            bool authenticated = try_connect_to_phone();
+            create_notification_message(message, sizeof(message), pair, 2, authenticated);
             queue_message_direct(message);
             
             processed += 2;  // Skip both events in the pair
         } else {
             // Single event
             char message[256];
-            create_notification_message(message, sizeof(message), &event_buffer[processed], 1);
+            bool authenticated = try_connect_to_phone();
+            create_notification_message(message, sizeof(message), &event_buffer[processed], 1, authenticated);
             queue_message_direct(message);
             
             processed += 1;
@@ -595,7 +713,8 @@ void add_event_to_batch(int door_state, time_t timestamp) {
             // Create pair message
             char message[256];
             door_event_t pair[2] = {event_buffer[prev], event_buffer[last]};
-            create_notification_message(message, sizeof(message), pair, 2);
+            bool authenticated = try_connect_to_phone();
+            create_notification_message(message, sizeof(message), pair, 2, authenticated);
             queue_message_direct(message);
             
             // Remove the pair from buffer
@@ -657,41 +776,6 @@ void queue_message_direct(const char* message) {
     ESP_LOGI(TAG, "Queued notification for retry: %s (Queue size: %d)", message, queue_count);
 }
 
-/**
- * Send door status to server via TCP (legacy function for immediate send)
- */
-void send_door_status(const char* status) {
-    int sock = 0;
-    struct sockaddr_in serv_addr;
-    char json_message[100];
-
-    snprintf(json_message, sizeof(json_message), "{\"STATUS\":\"%s\"}", status);
-
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        ESP_LOGE(TAG, "Socket creation error");
-        return;
-    }
-
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(SERVER_PORT);
-
-    if (inet_pton(AF_INET, SERVER_IP, &serv_addr.sin_addr) <= 0) {
-        ESP_LOGE(TAG, "Invalid address/ Address not supported");
-        close(sock);
-        return;
-    }
-
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        ESP_LOGE(TAG, "Connection Failed");
-        close(sock);
-        return;
-    }
-
-    send(sock, json_message, strlen(json_message), 0);
-    ESP_LOGI(TAG, "Message sent: %s", json_message);
-
-    close(sock);
-}
 
 /**
  * Function to configure GPIO pins
@@ -752,8 +836,9 @@ void app_main(void) {
     }
     
     // Initialize WiFi
-    ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+    ESP_LOGI(TAG, "Starting WiFi initialization in STA mode...");
     wifi_init_sta();
+    ESP_LOGI(TAG, "WiFi initialization completed");
     
     // Initialize and sync time via NTP
     if (wifi_connected) {
@@ -762,9 +847,13 @@ void app_main(void) {
     } else {
         ESP_LOGW(TAG, "WiFi not connected - time sync skipped");
     }
-    
+
+    // Initialize Bluetooth SPP for phone authentication
+    ESP_LOGI(TAG, "Starting Bluetooth SPP initialization...");
+    init_bluetooth_spp();
+
     // Print startup message
-    ESP_LOGI(TAG, "Door monitoring system with NTP sync and event batching started. Monitoring GPIO %d.", REED_SWITCH_PIN);
+    ESP_LOGI(TAG, "Door monitoring system with SPP authentication, NTP sync and event batching started. Monitoring GPIO %d for phone %s", REED_SWITCH_PIN, PHONE_BT_MAC);
     
     // Main monitoring loop
     while (1) {
