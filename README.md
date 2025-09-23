@@ -2,6 +2,8 @@
 
 A smart door monitoring system using ESP32-WROOM-32E that detects door events and authenticates them via Bluetooth. Sends notifications to your phone showing whether door activity was authorized (your phone nearby) or unauthorized.
 
+![Tripwire Banner](Tripwire_Banner.png)
+
 ## Quick Start
 
 ### Hardware Requirements
