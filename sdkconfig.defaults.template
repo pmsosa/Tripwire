@@ -2,14 +2,14 @@
 # These values will be used if not configured via menuconfig
 
 # WiFi Configuration (populated from environment variables)
-CONFIG_DOOR_WIFI_SSID="[REDACTED]"
-CONFIG_DOOR_WIFI_PASSWORD="[REDACTED]"
+CONFIG_DOOR_WIFI_SSID="__WIFI_SSID__"
+CONFIG_DOOR_WIFI_PASSWORD="__WIFI_PASSWORD__"
 
 # Bluetooth Configuration (populated from environment variables)
-CONFIG_DOOR_PHONE_BT_MAC="[REDACTED]"
+CONFIG_DOOR_PHONE_BT_MAC="__PHONE_BT_MAC__"
 
 # ntfy.sh Configuration (populated from environment variables)
-CONFIG_DOOR_NTFY_URL="https://ntfy.sh/[REDACTED]"
+CONFIG_DOOR_NTFY_URL="__NTFY_URL__"
 CONFIG_DOOR_NTFY_PRIORITY_DEFAULT=y
 
 # Enable WiFi and HTTP Client

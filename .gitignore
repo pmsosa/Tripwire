@@ -64,4 +64,4 @@ flash_encryption_key.bin
 secure_boot_signing_key.pem
 
 # menuconfig
-sdkconfig.defaults.*
+sdkconfig.defaults
