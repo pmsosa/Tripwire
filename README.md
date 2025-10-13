@@ -15,8 +15,8 @@ A smart door monitoring system using ESP32-WROOM-32E that detects door events an
 ### Setup Steps
 
 1. **Wire the Hardware**:
-   - Reed switch → GPIO 23
-   - Built-in LED on GPIO 2 provides status feedback
+   - Reed switch → GPIO 23 & GND
+   - Built-in LED on GPIO 2 provides status feedback (Note: LED not availble on some boards)
 
 2. **Create Environment File**:
    ```bash
@@ -36,6 +36,8 @@ A smart door monitoring system using ESP32-WROOM-32E that detects door events an
    - Install ntfy app (iOS/Android)
    - Subscribe to your topic URL
    - Enable Bluetooth on your phone
+
+![Example Gear Setup](setup.jpg)
 
 ## How It Works
 
